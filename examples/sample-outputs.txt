@@ -1,0 +1,136 @@
+# Example: info command
+# python scripts/fofa_smart.py info
+{"__fofa__": true, "error": false, "from_cache": false, "email": "user@example.com", "isvip": true, "fcoin": 100, "vip_level": 2}
+
+# Example: search command
+# python scripts/fofa_smart.py search -q 'host=".edu" && port="443"' -f "ip,port,host,title" -p 1 -s 100
+{
+  "__fofa__": true,
+  "error": false,
+  "from_cache": false,
+  "query_hash": "a1b2c3d4e5f6...",
+  "query_raw": "host=\".edu\" && port=\"443\"",
+  "fields": "ip,port,host,title",
+  "full": false,
+  "page": 1,
+  "size": 100,
+  "total": 10000,
+  "preview": [
+    {"ip": "1.2.3.4", "port": 443, "host": "www.university.edu", "title": "Welcome"},
+    {"ip": "5.6.7.8", "port": 443, "host": "portal.college.edu", "title": "Login"}
+  ],
+  "fpoints_consumed": 0
+}
+
+# Example: search with covering cache (page 2 served from page-1 cache)
+# python scripts/fofa_smart.py search -q 'host=".edu" && port="443"' -p 2 -s 100
+{
+  "__fofa__": true,
+  "error": false,
+  "from_cache": true,
+  "covering_cache": true,
+  "query_hash": "a1b2c3d4e5f6...",
+  "query_raw": "host=\".edu\" && port=\"443\"",
+  "fields": "ip,port,protocol,host,domain,title,server",
+  "full": false,
+  "page": 2,
+  "size": 100,
+  "total": 10000,
+  "preview": [{"ip": "9.10.11.12", "port": 443, "host": "www.school.edu", "title": "Home"}],
+  "fpoints_consumed": 0
+}
+
+# Example: stats command (single field)
+# python scripts/fofa_smart.py stats -q 'app="Apache"' -f "port"
+{
+  "__fofa__": true,
+  "error": false,
+  "distinct": {"ip": 1234567},
+  "aggs": [
+    {"count": 500000, "port": "80"},
+    {"count": 300000, "port": "443"},
+    {"count": 100000, "port": "8080"}
+  ]
+}
+
+# Example: stats command (multi-field aggregation)
+# python scripts/fofa_smart.py stats -q 'app="Apache"' -f "country,port"
+{
+  "__fofa__": true,
+  "error": false,
+  "distinct": {"ip": 1234567},
+  "aggs": [
+    {"count": 500000, "country": "US", "port": "80"},
+    {"count": 300000, "country": "CN", "port": "443"}
+  ]
+}
+
+# Example: host command (without detail)
+# python scripts/fofa_smart.py host --host "1.1.1.1"
+{
+  "__fofa__": true,
+  "error": false,
+  "host": "1.1.1.1",
+  "ip": "1.1.1.1",
+  "asn": 13335,
+  "org": "Cloudflare, Inc.",
+  "country_name": "United States",
+  "port": [80, 443],
+  "protocol": ["http", "https"]
+}
+
+# Example: host command (with detail)
+# python scripts/fofa_smart.py host --host "1.1.1.1" --detail
+{
+  "__fofa__": true,
+  "error": false,
+  "host": "1.1.1.1",
+  "ip": "1.1.1.1",
+  "asn": 13335,
+  "org": "Cloudflare, Inc.",
+  "country_name": "United States",
+  "port": [80, 443],
+  "protocol": ["http", "https"],
+  "details": [
+    {"port": 80, "protocol": "http", "banner": "HTTP/1.1 403 Forbidden"},
+    {"port": 443, "protocol": "https", "banner": "HTTP/1.1 403 Forbidden", "cert": {"subject": "CN=*.cloudflare.com"}}
+  ]
+}
+
+# Example: cache-read command
+# python scripts/fofa_smart.py cache-read --hash "a1b2c3d4e5f6..." -p 2 -s 50
+{
+  "__fofa__": true,
+  "error": false,
+  "query_hash": "a1b2c3d4e5f6...",
+  "query_raw": "host=\".edu\" && port=\"443\"",
+  "total": 10000,
+  "page": 2,
+  "size": 50,
+  "results": [{"ip": "9.10.11.12", "port": 443, "host": "www.school.edu", "title": "Home"}],
+  "cache_expired": false
+}
+
+# Example: cache-export command
+# python scripts/fofa_smart.py cache-export --hash "a1b2c3d4e5f6..." --format csv -o results.csv
+{"__fofa__": true, "error": false, "path": "/path/to/results.csv", "total": 10000, "format": "csv", "cache_expired": false}
+
+# Example: audit-log command
+# python scripts/fofa_smart.py audit-log --limit 5
+{
+  "__fofa__": true,
+  "error": false,
+  "total": 3,
+  "entries": [
+    {"timestamp": "2026-06-14 22:30:00", "command": "search", "query_hash": "abc123...", "query_raw": "domain=\"example.com\"", "params": "{\"page\": 1, \"size\": 100}", "result_code": 0, "duration_ms": 523},
+    {"timestamp": "2026-06-14 22:29:00", "command": "info", "query_hash": null, "query_raw": null, "params": null, "result_code": 0, "duration_ms": 210}
+  ]
+}
+
+# Example: error response
+# Invalid key → python scripts/fofa_smart.py info
+{"__fofa__": true, "error": true, "msg": "FOFA API [90001]: Invalid email", "code": 1002}
+
+# Example: F-point denied
+# python scripts/fofa_smart.py search -q 'domain="example.com"' -p 2
+{"__fofa__": true, "error": true, "msg": "F-point spend denied: pagination requires F-points. Explicitly authorize and retry.", "code": 2001}

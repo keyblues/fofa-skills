@@ -1,0 +1,25 @@
+[project]
+name = "fofa-skills"
+version = "0.1.0"
+description = "FOFA cyberspace search engine skill — AI-callable CLI with caching, F-point guard, and zero pip dependencies"
+readme = "README_EN.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{name = "fofa-skills contributors"}]
+keywords = ["fofa", "cyberspace", "search", "cli", "ai-tool"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Security",
+]
+
+[project.scripts]
+fofa-skills = "scripts.fofa_smart:main"
+
+[tool.setuptools]
+py-modules = []
