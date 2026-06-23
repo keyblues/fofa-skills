@@ -30,10 +30,16 @@ ERROR_CODES: Dict[str, int] = {
     "NO_API_ACCESS":  2002,
     "QUOTA_EXCEEDED": 2003,
     "CACHE_MISS":     3001,
-    "INTERNAL_ERROR": 5001,
+    "NOT_FOUND":      4004,
     "INVALID_PARAM":  4001,
+    "INTERNAL_ERROR": 5001,
 }
 # fmt: on
+
+# FOFA API 响应中可能与成功信封冲突的字段——必须在 make_success 中剔除，
+# 否则 FOFA 返回的 "error": 0 (int) 会覆盖我们设置的 "error": False (bool)，
+# 破坏 JSON 输出的类型一致性，导致 AI 解析异常。
+_API_CONFLICT_KEYS = frozenset({"error", "errmsg", "code", "__fofa__"})
 
 
 def make_error(msg: str, code: str = "INTERNAL_ERROR") -> Dict[str, Any]:
@@ -42,9 +48,15 @@ def make_error(msg: str, code: str = "INTERNAL_ERROR") -> Dict[str, Any]:
 
 
 def make_success(**kwargs: Any) -> Dict[str, Any]:
-    """Build a structured success response."""
+    """Build a structured success response.
+
+    自动剔除 FOFA API 响应中可能与信封冲突的字段（error/errmsg/code/__fofa__），
+    确保输出信封的类型一致性。
+    """
     result: Dict[str, Any] = {"__fofa__": True, "error": False}
-    result.update(kwargs)
+    for k, v in kwargs.items():
+        if k not in _API_CONFLICT_KEYS:
+            result[k] = v
     return result
 
 

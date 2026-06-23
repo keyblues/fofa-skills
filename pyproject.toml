@@ -22,4 +22,4 @@ classifiers = [
 fofa-skills = "scripts.fofa_smart:main"
 
 [tool.setuptools]
-py-modules = []
+packages = ["scripts"]

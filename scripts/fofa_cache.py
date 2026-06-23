@@ -14,6 +14,7 @@ query_cache — one row per unique query (hash → metadata)
     page        INTEGER            requested page number
     size        INTEGER            requested page size
     total       INTEGER            total results returned
+    tag         TEXT               optional target/label grouping queries in one assessment
     created_at  TEXT               ISO datetime
     expires_at  TEXT               ISO datetime (24h for full=0, 7d for full=1)
 
@@ -45,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -64,6 +66,43 @@ INDEXED_FIELDS = frozenset({
     "ip", "port", "protocol", "host", "domain", "title", "server",
     "country", "banner", "jarm", "icp", "cname",
 })
+
+# Default high-risk exposed ports for report(). Covers remote access, DBs,
+# caches/search, devops, and unauthenticated admin surfaces commonly seen in
+# real exposure assessments. Overridable via report(high_risk_ports=...).
+DEFAULT_HIGH_RISK_PORTS = (
+    22,    # SSH
+    23,    # Telnet
+    3389,  # RDP
+    5900,  # VNC
+    3306,  # MySQL
+    5432,  # PostgreSQL
+    1433,  # MSSQL
+    1521,  # Oracle
+    6379,  # Redis
+    27017, # MongoDB
+    9200,  # Elasticsearch
+    11211, # Memcached
+    445,   # SMB
+    2375,  # Docker daemon (unauth)
+    5601,  # Kibana
+    6443,  # Kubernetes API
+)
+
+# Default admin-panel title keywords for report(). Broad recall over Chinese +
+# English panel/product names. Overridable via report(admin_keywords=...).
+DEFAULT_ADMIN_KEYWORDS = (
+    "管理", "后台", "登录", "管理员",
+    "admin", "login", "manage", "management", "dashboard", "console",
+    "phpmyadmin", "adminer",
+    "grafana", "jenkins", "nacos", "apollo", "consul",
+    "jboss", "weblogic", "tomcat", "wildfly",
+    "struts", "spring",
+)
+
+# 过滤字段名白名单正则：只允许字母开头、字母数字下划线点
+# 防止 SQL 注入——field 名直接拼入 SQL，必须严格校验
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
 
 @contextmanager
@@ -103,6 +142,7 @@ def init_db(db_path: Optional[str] = None) -> None:
                 page       INTEGER NOT NULL DEFAULT 1,
                 size       INTEGER NOT NULL DEFAULT 100,
                 total      INTEGER NOT NULL DEFAULT 0,
+                tag        TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 expires_at TEXT
             );
@@ -140,6 +180,12 @@ def init_db(db_path: Optional[str] = None) -> None:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS host_cache (
+                key        TEXT PRIMARY KEY,
+                data       TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS audit_log (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp   TEXT NOT NULL,
@@ -163,6 +209,8 @@ def init_db(db_path: Optional[str] = None) -> None:
             ("cname", "TEXT", ""),
         ]:
             _add_column_if_not_exists(conn, "query_result", col, ctype, default)
+        # tag column on query_cache (target grouping for assessment workflows)
+        _add_column_if_not_exists(conn, "query_cache", "tag", "TEXT", "")
 
         conn.commit()
 
@@ -214,7 +262,7 @@ def find_covering_cache(
     """
     with _get_db(db_path) as conn:
         rows = conn.execute(
-            "SELECT query_hash, page AS cached_page, size AS cached_size, total "
+            "SELECT query_hash, page AS cached_page, size AS cached_size, total, tag "
             "FROM query_cache WHERE query_raw = ? AND fields = ? AND full = ? "
             "AND (expires_at IS NULL OR expires_at > ?)",
             (query_raw, fields, int(full), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
@@ -247,19 +295,32 @@ def save(
     size: int,
     total: int,
     results: List[Dict[str, Any]],
+    tag: str = "",
     db_path: Optional[str] = None,
 ) -> None:
-    """Persist query metadata and results to cache."""
+    """Persist query metadata and results to cache.
+
+    *tag* is an optional target/label that groups queries belonging to one
+    assessment (e.g. "acme.com"). It lets ``correlate``/``report`` operate
+    on a whole target without the AI having to remember individual hashes.
+    """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ttl = FULL_TRUE_TTL_HOURS if full else FULL_FALSE_TTL_HOURS
     expires = (datetime.now() + timedelta(hours=ttl)).strftime("%Y-%m-%d %H:%M:%S")
 
     with _get_db(db_path) as conn:
+        # Preserve an existing tag if this save omits one (covering-cache refresh).
+        if not tag:
+            existing = conn.execute(
+                "SELECT tag FROM query_cache WHERE query_hash = ?", (query_hash,)
+            ).fetchone()
+            if existing is not None:
+                tag = existing["tag"] or ""
         conn.execute(
             """INSERT OR REPLACE INTO query_cache
-               (query_hash, query_raw, fields, full, page, size, total, created_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (query_hash, query_raw, fields, int(full), page, size, total, now, expires),
+               (query_hash, query_raw, fields, full, page, size, total, tag, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (query_hash, query_raw, fields, int(full), page, size, total, tag, now, expires),
         )
         conn.execute("DELETE FROM query_result WHERE cache_id = ?", (query_hash,))
         for item in results:
@@ -299,6 +360,7 @@ def read(
     filters: Optional[List[Dict[str, str]]] = None,
     page: int = 1,
     size: int = 100,
+    offset: Optional[int] = None,
     db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read cached results with optional filtering and pagination.
@@ -306,8 +368,12 @@ def read(
     Args:
         cache_id: query_hash to read from.
         filters: list of {"field": str, "op": "eq"|"like", "value": str} dicts.
-        page: 1-based page number.
+        page: 1-based page number. Used to compute offset when *offset* is None.
         size: results per page.
+        offset: explicit 0-based offset into the cached rows. If None, computed
+            as (page - 1) * size. Useful when slicing out of a covering cache
+            whose first stored row does not correspond to global offset 0.
+        db_path: optional database path.
 
     Returns:
         {"total": int, "page": int, "size": int, "results": [...]}
@@ -321,6 +387,9 @@ def read(
                 field = f["field"]
                 op = f.get("op", "eq")
                 value = f["value"]
+                # 白名单校验 field 名，防止 SQL 注入
+                if not _FIELD_NAME_RE.fullmatch(field):
+                    raise ValueError(f"Invalid filter field name: {field!r}")
                 col = field if field in INDEXED_FIELDS else f"json_extract(data, '$.{field}')"
                 if op == "eq":
                     where.append(f"{col} = ?")
@@ -336,7 +405,8 @@ def read(
         ).fetchone()
         total: int = count_row["cnt"]
 
-        offset = (page - 1) * size
+        if offset is None:
+            offset = (page - 1) * size
         rows = conn.execute(
             f"SELECT data FROM query_result WHERE {where_clause} ORDER BY id LIMIT ? OFFSET ?",
             params + [size, offset],
@@ -386,6 +456,33 @@ def set_info_cache(data: Dict[str, Any], db_path: Optional[str] = None) -> None:
         conn.commit()
 
 
+# Cache TTL for host/stats responses (both free endpoints).
+HOST_CACHE_TTL: int = 300  # 5 minutes
+
+
+def get_host_cache(cache_key: str, db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Return cached host/stats response if within TTL, else None."""
+    with _get_db(db_path) as conn:
+        row = conn.execute(
+            "SELECT data, updated_at FROM host_cache WHERE key = ?", (cache_key,)
+        ).fetchone()
+    if row is None:
+        return None
+    if time.time() - row["updated_at"] > HOST_CACHE_TTL:
+        return None
+    return json.loads(row["data"])
+
+
+def set_host_cache(cache_key: str, data: Dict[str, Any], db_path: Optional[str] = None) -> None:
+    """Store host/stats response with current timestamp."""
+    with _get_db(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO host_cache (key, data, updated_at) VALUES (?, ?, ?)",
+            (cache_key, json.dumps(data, ensure_ascii=False), time.time()),
+        )
+        conn.commit()
+
+
 def cache_stats(db_path: Optional[str] = None) -> Dict[str, Any]:
     """Return count of cached queries and result rows."""
     with _get_db(db_path) as conn:
@@ -404,53 +501,325 @@ def delete_cache(query_hash: str, db_path: Optional[str] = None) -> bool:
         return cur.rowcount > 0
 
 
-def export_cache(
-    query_hash: str,
-    fmt: str = "json",
-    output_path: Optional[str] = None,
+def list_queries(
+    query: Optional[str] = None,
+    tag: Optional[str] = None,
+    limit: int = 100,
     db_path: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Export cached results to a file. Returns {path, total, format}.
+) -> List[Dict[str, Any]]:
+    """List cached queries with optional filters — the AI's "hash recovery" primitive.
+
+    Long assessment workflows compress out of context; this lets the AI recover
+    the query_hash ↔ query_raw ↔ tag mapping it lost, so ``correlate``/``report``
+    never need a re-fetch (re-spend of F-points).
 
     Args:
-        query_hash: cache id to export.
-        fmt: "json" or "csv".
-        output_path: file path to write. Auto-generated if None.
+        query: substring / regex matched against query_raw (case-insensitive).
+               Use to find "everything I queried about acme.com".
+        tag:    exact tag match (e.g. "acme.com" target grouping).
+        limit:  cap on rows returned (default 100).
+
+    Returns list of {query_hash, query_raw, fields, full, page, size, total,
+    tag, created_at, expires_at, result_count} ordered newest-first.
     """
-    # Read in batches to avoid loading the entire dataset into memory at once
-    batch_size = 5000
-    all_results: List[Dict[str, Any]] = []
-    page_num = 1
-    while True:
-        batch = read(query_hash, page=page_num, size=batch_size, db_path=db_path)
-        all_results.extend(batch["results"])
-        if len(all_results) >= batch["total"] or not batch["results"]:
-            break
-        page_num += 1
+    clauses: List[str] = []
+    params: List[Any] = []
+    if query:
+        # LIKE with escaped wildcards so a literal %/_ in the query is matched as-is
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        clauses.append("query_raw LIKE ? ESCAPE '\\'")
+        params.append(f"%{escaped}%")
+    if tag:
+        clauses.append("tag = ?")
+        params.append(tag)
 
-    if output_path is None:
-        ext = "json" if fmt == "json" else "csv"
-        output_path = os.path.join(
-            os.path.dirname(db_path or DB_PATH), f"export_{query_hash[:12]}.{ext}"
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+
+    with _get_db(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT qc.query_hash, qc.query_raw, qc.fields, qc.full, qc.page,
+                       qc.size, qc.total, qc.tag, qc.created_at, qc.expires_at,
+                       (SELECT COUNT(*) FROM query_result qr WHERE qr.cache_id = qc.query_hash) AS result_count
+                FROM query_cache qc{where}
+                ORDER BY qc.created_at DESC LIMIT ?""",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def resolve_tag_to_hashes(
+    tag: str,
+    db_path: Optional[str] = None,
+) -> List[str]:
+    """Return all query_hash values tagged with *tag*, newest-first.
+
+    Used by ``correlate --tag`` and ``report --tag`` so the AI can operate on
+    a whole assessment target without enumerating hashes.
+    """
+    with _get_db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT query_hash FROM query_cache WHERE tag = ? "
+            "ORDER BY created_at DESC",
+            (tag,),
+        ).fetchall()
+    return [r["query_hash"] for r in rows]
+
+
+def set_tag(
+    query_hash: str,
+    tag: str,
+    db_path: Optional[str] = None,
+) -> int:
+    """Retroactively tag an already-cached query. Returns rows updated (0 or 1).
+
+    Lets the AI group searches that were performed without ``--tag`` into an
+    assessment target — no re-fetch, no F-point re-spend. Empty *tag* clears
+    an existing tag.
+    """
+    with _get_db(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE query_cache SET tag = ? WHERE query_hash = ?",
+            (tag, query_hash),
         )
+        conn.commit()
+        return cur.rowcount
 
-    if fmt == "json":
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(all_results, f, ensure_ascii=False, indent=2)
-    elif fmt == "csv":
-        import csv
-        results = all_results
-        if not results:
-            with open(output_path, "w", encoding="utf-8", newline="") as f:
-                f.write("")
-        else:
-            headers = list(results[0].keys())
-            with open(output_path, "w", encoding="utf-8", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(results)
 
-    return {"path": os.path.abspath(output_path), "total": len(all_results), "format": fmt}
+# ------------------------------------------------------------------ correlate / report
+
+
+def correlate(
+    hashes: List[str],
+    key: str = "ip",
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cross-query correlation and de-duplication.
+
+    Merges results from multiple cached queries, de-duplicating by *key*
+    (default ``ip``). Returns counts and per-query unique assets without
+    loading all rows into memory — all work happens in SQLite.
+
+    Returns:
+        {
+            "total_unique": int,          # unique key values across all queries
+            "duplicates_removed": int,    # total rows minus unique keys
+            "per_query": [{query_hash, query_raw, total, unique_by_key}],
+            "key": str,
+            "overlap_matrix": [[...]],    # NxN; diagonal = per-query unique count, off-diagonal = shared
+        }
+    """
+    # Validate key field
+    if not _FIELD_NAME_RE.fullmatch(key):
+        raise ValueError(f"Invalid correlation key: {key!r}")
+
+    col = key if key in INDEXED_FIELDS else f"json_extract(data, '$.{key}')"
+
+    with _get_db(db_path) as conn:
+        # Gather metadata for each hash
+        metas: List[Dict[str, Any]] = []
+        for h in hashes:
+            row = conn.execute(
+                "SELECT query_hash, query_raw, total FROM query_cache WHERE query_hash = ?",
+                (h,),
+            ).fetchone()
+            if row:
+                metas.append(dict(row))
+            else:
+                metas.append({"query_hash": h, "query_raw": None, "total": 0})
+
+        # Global unique key values via UNION
+        union_parts = []
+        union_params: List[str] = []
+        for h in hashes:
+            union_parts.append(f"SELECT {col} AS k FROM query_result WHERE cache_id = ? AND {col} != ''")
+            union_params.append(h)
+        union_sql = " UNION ".join(union_parts)
+        unique_rows = conn.execute(union_sql, union_params).fetchall()
+        total_unique = len(unique_rows)
+
+        # Total non-empty-key rows across all queries (empty keys are not
+        # real assets and must not inflate the duplicates count).
+        placeholders = ",".join("?" * len(hashes))
+        total_rows_row = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM query_result WHERE cache_id IN ({placeholders}) AND {col} != ''",
+            hashes,
+        ).fetchone()
+        total_rows: int = total_rows_row["cnt"]
+
+        # Per-query unique counts (also seeds the overlap-matrix diagonal)
+        n = len(hashes)
+        overlap_matrix: List[List[int]] = [[0] * n for _ in range(n)]
+        per_query: List[Dict[str, Any]] = []
+        for i, h in enumerate(hashes):
+            unique_count_row = conn.execute(
+                f"SELECT COUNT(DISTINCT {col}) AS cnt FROM query_result WHERE cache_id = ? AND {col} != ''",
+                (h,),
+            ).fetchone()
+            unique_cnt = unique_count_row["cnt"]
+            overlap_matrix[i][i] = unique_cnt  # diagonal = set cardinality
+            per_query.append({
+                "query_hash": h,
+                "query_raw": metas[i].get("query_raw"),
+                "total": metas[i].get("total", 0),
+                "unique_by_key": unique_cnt,
+            })
+
+        # Overlap matrix off-diagonal: for each pair (i, j), shared key values
+        for i in range(n):
+            for j in range(i + 1, n):
+                shared_row = conn.execute(
+                    f"""SELECT COUNT(*) AS cnt FROM (
+                        SELECT DISTINCT {col} AS k FROM query_result WHERE cache_id = ? AND {col} != ''
+                        INTERSECT
+                        SELECT DISTINCT {col} AS k FROM query_result WHERE cache_id = ? AND {col} != ''
+                    )""", (hashes[i], hashes[j])).fetchone()
+                shared = shared_row["cnt"]
+                overlap_matrix[i][j] = shared
+                overlap_matrix[j][i] = shared
+
+    return {
+        "total_unique": total_unique,
+        "duplicates_removed": max(0, total_rows - total_unique),
+        "per_query": per_query,
+        "key": key,
+        "overlap_matrix": overlap_matrix,
+    }
+
+
+def report(
+    hashes: List[str],
+    db_path: Optional[str] = None,
+    high_risk_ports: Optional[tuple] = None,
+    admin_keywords: Optional[tuple] = None,
+    detail_limit: int = 100,
+) -> Dict[str, Any]:
+    """Generate a summary report across multiple cached queries.
+
+    Aggregates port, country, server, protocol distributions and high-risk
+    indicators directly in SQLite — no API calls, no context flooding.
+
+    Args:
+        high_risk_ports: override the default high-risk port list (ints).
+        admin_keywords: override the default admin-panel title keywords (strs).
+        detail_limit: cap on ``high_risk_ports`` and ``admin_panels`` rows
+            (default 100). Lower this in context-constrained situations.
+
+    Returns:
+        {
+            "total_assets": int,
+            "total_unique_ips": int,
+            "by_port": [{"port": int, "count": int}],
+            "by_country": [{"country": str, "count": int}],
+            "by_protocol": [{"protocol": str, "count": int}],
+            "by_server": [{"server": str, "count": int}],
+            "high_risk_ports": [{"ip": str, "port": int, "host": str}],
+            "admin_panels": [{"ip": str, "host": str, "title": str}],
+            "per_query": [{hash, query_raw, total}],
+        }
+    """
+    if not hashes:
+        return {
+            "total_assets": 0,
+            "total_unique_ips": 0,
+            "by_port": [],
+            "by_country": [],
+            "by_protocol": [],
+            "by_server": [],
+            "high_risk_ports": [],
+            "admin_panels": [],
+            "per_query": [],
+        }
+
+    placeholders = ",".join("?" * len(hashes))
+    high_risk_ports = tuple(high_risk_ports) if high_risk_ports else DEFAULT_HIGH_RISK_PORTS
+    # Normalize ports to int (CLI passes strings) and dedupe, preserving order.
+    normalized_ports: List[int] = []
+    seen_ports: set = set()
+    for p in high_risk_ports:
+        try:
+            pi = int(p)
+        except (ValueError, TypeError):
+            continue
+        if pi not in seen_ports:
+            seen_ports.add(pi)
+            normalized_ports.append(pi)
+    high_risk_ports = tuple(normalized_ports) or DEFAULT_HIGH_RISK_PORTS
+    hr_placeholders = ",".join("?" * len(high_risk_ports))
+    admin_keywords = tuple(admin_keywords) if admin_keywords else DEFAULT_ADMIN_KEYWORDS
+
+    with _get_db(db_path) as conn:
+        total_row = conn.execute(
+            f"SELECT COUNT(*) AS cnt FROM query_result WHERE cache_id IN ({placeholders})",
+            hashes,
+        ).fetchone()
+        total_assets: int = total_row["cnt"]
+
+        unique_ip_row = conn.execute(
+            f"SELECT COUNT(DISTINCT ip) AS cnt FROM query_result WHERE cache_id IN ({placeholders}) AND ip != ''",
+            hashes,
+        ).fetchone()
+        total_unique_ips: int = unique_ip_row["cnt"]
+
+        # Distribution queries (top 20 each)
+        def _agg(col: str, label: str, limit: int = 20) -> List[Dict[str, Any]]:
+            rows = conn.execute(
+                f"SELECT {col} AS {label}, COUNT(*) AS cnt FROM query_result "
+                f"WHERE cache_id IN ({placeholders}) AND {col} != '' "
+                f"GROUP BY {col} ORDER BY cnt DESC LIMIT ?",
+                (*hashes, limit),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+        by_port = _agg("port", "port")
+        by_country = _agg("country", "country")
+        by_protocol = _agg("protocol", "protocol")
+        by_server = _agg("server", "server")
+
+        # High-risk exposed ports
+        hr_rows = conn.execute(
+            f"""SELECT DISTINCT ip, port, host FROM query_result
+                WHERE cache_id IN ({placeholders}) AND port IN ({hr_placeholders}) AND ip != ''
+                ORDER BY ip LIMIT ?""",
+            (*hashes, *high_risk_ports, detail_limit),
+        ).fetchall()
+        high_risk_list = [dict(r) for r in hr_rows]
+
+        # Admin panels (title LIKE any keyword)
+        admin_clauses = " OR ".join(["title LIKE ?" for _ in admin_keywords])
+        admin_params = [f"%{kw}%" for kw in admin_keywords]
+        admin_rows = conn.execute(
+            f"""SELECT DISTINCT ip, host, title FROM query_result
+                WHERE cache_id IN ({placeholders}) AND ({admin_clauses})
+                ORDER BY ip LIMIT ?""",
+            (*hashes, *admin_params, detail_limit),
+        ).fetchall()
+        admin_list = [dict(r) for r in admin_rows]
+
+        # Per-query metadata (include a placeholder for missing hashes so the
+        # caller can tell which hash was not found — mirrors correlate()).
+        per_query: List[Dict[str, Any]] = []
+        for h in hashes:
+            row = conn.execute(
+                "SELECT query_hash, query_raw, total FROM query_cache WHERE query_hash = ?",
+                (h,),
+            ).fetchone()
+            if row:
+                per_query.append(dict(row))
+            else:
+                per_query.append({"query_hash": h, "query_raw": None, "total": 0})
+
+    return {
+        "total_assets": total_assets,
+        "total_unique_ips": total_unique_ips,
+        "by_port": by_port,
+        "by_country": by_country,
+        "by_protocol": by_protocol,
+        "by_server": by_server,
+        "high_risk_ports": high_risk_list,
+        "admin_panels": admin_list,
+        "per_query": per_query,
+    }
 
 
 # ------------------------------------------------------------------ audit log
@@ -490,6 +859,14 @@ def log_audit(
             ),
         )
         conn.commit()
+
+
+def clean_audit_log(before_date: str, db_path: Optional[str] = None) -> int:
+    """Delete audit log entries older than *before_date* (ISO format). Returns deleted count."""
+    with _get_db(db_path) as conn:
+        cur = conn.execute("DELETE FROM audit_log WHERE timestamp < ?", (before_date,))
+        conn.commit()
+    return cur.rowcount
 
 
 def read_audit_log(

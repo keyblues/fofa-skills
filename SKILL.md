@@ -1,4 +1,4 @@
----
+o---
 name: fofa-skills
 description: FOFA cyberspace search engine skill — asset discovery, vulnerability mapping, threat intelligence, fingerprinting, and statistical aggregation.
 version: "0.1.0"
@@ -10,6 +10,9 @@ triggers:
     - 资产测绘
     - 测绘
     - 资产发现
+    - 资产暴露面
+    - 暴露面
+    - 暴露面测绘
     - fofa搜索
     - 指纹识别
     - 漏洞测绘
@@ -18,6 +21,15 @@ triggers:
     - JARM
     - 证书搜索
     - ICP备案
+    - 网络安全评估
+    - 安全评估
+    - 子域名
+    - 子域名发现
+    - C2追踪
+    - 钓鱼检测
+    - 资产盘点
+    - 攻击面
+    - attack surface
   scenarios:
     - User asks about asset discovery for a domain/IP/organization
     - User wants to find exposed services, databases, or components
@@ -26,6 +38,10 @@ triggers:
     - User asks about statistical distribution of internet assets
     - User performs threat intelligence (phishing, C2, suspicious infrastructure)
     - User wants to correlate assets across dimensions (domain→IP→other domains)
+    - User requests full exposure assessment for an organization
+    - User wants to enumerate all subdomains of a target
+    - User asks about attack surface mapping
+    - User wants to assess security exposure of their own assets
 compatibility:
   claude_code: ">=1.0.0"
   python: ">=3.9"
@@ -89,6 +105,8 @@ If script returns `{"__fofa__": true, "error": true, "code": 1002}`:
 Optional env vars:
 - `FOFA_DB_PATH` — SQLite path, default `./data/fofa_cache.db`
 - `FOFA_BASE_URL` — API base URL, default `https://fofa.info/api/v1`
+- `FOFA_FPOINTS_BUDGET` — session-level F-point budget (int). When set, paginated requests are allowed without per-request AI confirmation as long as cumulative estimated spend stays under the budget. Spent total persists across CLI invocations via a state file. AI must still inform the user of total expected spend before starting a multi-search playbook.
+- `FOFA_ALLOW_FPOINTS` — set to `true` to bypass the code-level hard block on pagination (per-request authorization mode). See note below.
 
 > **Note on `FOFA_ALLOW_FPOINTS=true`**: Even when set, AI must still notify the user before every paginated request that F-points will be consumed and wait for confirmation. This env var only bypasses the code-level hard block, not the AI-level confirmation obligation.
 
@@ -110,21 +128,31 @@ Optional env vars:
 - Always explain query parts in plain language — never raw-paste FOFA syntax to user
 - When multiple queries are needed, batch them and explain the workflow
 - When user is doing comprehensive reconnaissance, suggest cross-referencing with Censys/Shodan for validation (FOFA's strength is Chinese internet space; other engines may have better global coverage)
+- **For exposure assessment / asset inventory requests**: ALWAYS follow the Playbooks in "Asset Discovery Playbooks" section — never just run a single `search`. Multi-dimensional coverage is mandatory.
+- **For subdomain enumeration**: Run ALL techniques in Playbook 4, not just `host=".target.com"`. Certificate SAN and CNAME techniques find subdomains DNS misses.
+- **Before paginated (paid) searches**: Always run `stats` first to estimate scope. If >100 results, warn user about F-point cost and ask for authorization.
 
 ## Intent → Command Mapping
 
-| User Intent | Command | Example |
-|-------------|---------|---------|
-| Find assets under a domain/IP | `search` | "What services does example.com have?" |
-| Find exposed services/components | `search` | "Find exposed MySQL on the internet" |
-| Vulnerability impact assessment | `search --full` | "What assets are affected by Log4j?" |
-| Assets matching a fingerprint | `search` | "Sites with icon_hash xxx" |
-| Distribution of a dimension | `stats` | "Port distribution of Apache" |
-| Details of a specific IP/domain | `host` | "What's running on 1.1.1.1?" |
-| Check account status | `info` | "How many F-points do I have?" |
-| Re-view previous query results | `cache-read` | "Show me that search again" |
-| Export results to file | `cache-export` | "Export results as CSV" |
-| View operation history | `audit-log` | "What queries have been run?" |
+| User Intent | Command | Playbook |
+|-------------|---------|----------|
+| Find assets under a domain/IP | `search` | — |
+| Find exposed services/components | `search` | — |
+| Full exposure assessment for org | `search` + `stats` | Playbook 1 (7 dimensions) |
+| Vulnerability impact assessment | `search --full` | Playbook 2 |
+| Threat intel / C2 hunting | `search` | Playbook 3 |
+| Enumerate all subdomains | `search` + `stats` | Playbook 4 (6 techniques) |
+| Fingerprint identification | `search` | Playbook 5 |
+| Assets matching a fingerprint | `search` | — |
+| Distribution of a dimension | `stats` | — |
+| Details of a specific IP/domain | `host` | — |
+| Check account status | `info` | — |
+| Re-view previous query results | `cache-read` | — |
+| Cross-query correlation & de-dup | `correlate` | — |
+| Aggregated summary report | `report` | — |
+| View operation history | `audit-log` | — |
+| Purge old audit log entries | `audit-clean` | — |
+
 
 ### `search` vs `host`
 
@@ -175,78 +203,22 @@ Convert natural language to FOFA query:
 - `-s` max 10000
 - For time-bounded queries, use `after` and `before` fields to narrow scope
 
-## Penetration Testing Workflows
+## Asset Discovery Playbooks
 
-### Cross-Correlation Analysis (Pivoting)
+Detailed playbooks have been extracted to **[docs/playbooks.md](docs/playbooks.md)** to keep this instruction file concise. Read that document before any reconnaissance task.
 
-Discover related assets by pivoting through shared infrastructure. This is a common workflow in penetration testing and threat intelligence:
-
-1. **Domain → IP → Other Domains**: Find all domains hosted on the same IP
-2. **Certificate Correlation**: Find all hosts sharing the same certificate
-3. **JARM-based C2 Detection**: Identify C2 infrastructure with matching TLS fingerprints
-4. **Banner Fingerprinting**: Identify services by their banner responses
-
-Example multi-step correlation workflow:
-
-```bash
-# Step 1: Find IPs for a domain
-python scripts/fofa_smart.py search -q 'domain="target.com"' -f "ip,domain,host"
-
-# Step 2: Pivot — find OTHER domains on those IPs (same infrastructure)
-python scripts/fofa_smart.py search -q 'ip="1.2.3.4" && domain!="target.com"' -f "domain,host,title"
-
-# Step 3: Certificate correlation — find all hosts sharing the same certificate
-python scripts/fofa_smart.py search -q 'cert.subject="CN=*.target.com"' -f "host,ip,title"
-
-# Step 4: JARM fingerprint — identify similar infrastructure
-python scripts/fofa_smart.py search -q 'jarm="29d29d15d29d29d000..." && country="CN"' -f "host,ip,port"
-```
-
-### C2 Detection via JARM
-
-JARM fingerprinting helps identify C2 infrastructure. Common C2 frameworks have known JARM hashes:
-
-```bash
-# Search by known C2 JARM hash
-python scripts/fofa_smart.py search -q 'jarm="07d14d16d21d21d000..." && port="443"'
-
-# Combine with other indicators for higher confidence
-python scripts/fofa_smart.py search -q 'jarm="07d14d16d21d21d000..." && cert.issuer="CN=Unknown"'
-```
-
-### Deep Certificate Analysis
-
-Fine-grained certificate queries for threat intelligence:
-
-```bash
-# Find all certificates issued by a specific CA for a domain
-python scripts/fofa_smart.py search -q 'cert.subject="O=Target Org" && cert.issuer="CN=DigiCert"'
-
-# Find self-signed certificates for a domain (potential staging infrastructure)
-python scripts/fofa_smart.py search -q 'cert.subject="CN=*.target.com" && cert.issuer="CN=*.target.com"'
-
-# Broad cert search
-python scripts/fofa_smart.py search -q 'cert="CN=*.suspicious.com"'
-```
-
-### ICP Filing Correlation
-
-For Chinese internet assets, ICP filing numbers can link domains to organizations:
-
-```bash
-# Find all domains under the same ICP filing
-python scripts/fofa_smart.py search -q 'icp="京ICP备12345678"' -f "domain,host,title"
-```
-
-### Cross-Engine Validation Tips
-
-For comprehensive reconnaissance, consider cross-referencing FOFA results with:
-
-- **Censys**: Validates TLS certificate data and host service enumeration. Strong for academic/research networks.
-- **Shodan**: Confirms banner/service fingerprints and industrial system exposure. Strong for IoT/ICS.
-- **FOFA's strength**: Chinese internet space coverage, ICP filing data, and large historical dataset.
-
-> Note: This skill only covers FOFA. Cross-referencing requires separate tools, but AI should suggest it when appropriate.
+It contains:
+- The 7-Dimension Asset Discovery Model
+- Query Optimization techniques (how to find more than others)
+- Playbook 1: Full Exposure Assessment (Organization-Wide)
+- Playbook 2: Vulnerability Impact Assessment
+- Playbook 3: Threat Intelligence & C2 Hunting
+- Playbook 4: Subdomain Discovery (6 techniques)
+- Playbook 5: Fingerprint Identification & Component Mapping
+- Asset De-duplication Strategy
+- Risk Prioritization Framework
+- F-Point Budget Strategy for Playbooks
+- Cross-Engine Validation
 
 ## Database
 
@@ -255,7 +227,10 @@ Auto-created on first run at `data/fofa_cache.db`:
 - `query_cache` — query metadata, PK: query_hash (SHA-256)
 - `query_result` — one row per result, `data` column stores full JSON, indexed columns for ip/port/host/banner/jarm/icp/cname
 - `info_cache` — account info cache, TTL 5 min
+- `host_cache` — `host` and `stats` response cache, TTL 5 min (free endpoints)
 - `audit_log` — operation audit trail with timestamp, command, query, result code, and duration
+
+A separate state file `data/fpoints_state.json` tracks cumulative F-point spend when `FOFA_FPOINTS_BUDGET` is set (not a DB table — it must persist across CLI invocations within a session).
 
 ## Workflow
 
@@ -269,20 +244,32 @@ Auto-created on first run at `data/fofa_cache.db`:
 1. **Identify intent** → pick command per "Intent → Command Mapping"
 2. **Build query** → per "Query Construction"
 3. **Show & explain the query** — explain each part in plain language (e.g., `host=".edu"` → "hostname ending in .edu"), do NOT copy-paste from syntax reference
-4. Run the command (add `--no-cache` if user says "fresh data"/"re-query")
+4. Run the command (add `--no-cache` if user says "fresh data"/"re-query"). For any multi-search assessment, pass `--tag <target>` so later correlate/report work without tracking hashes.
 5. Show summary (total + preview), **never dump full results**
 6. For more data → `cache-read`
-7. For export → `cache-export`
-8. For correlation/pivoting → suggest multi-step workflow per "Penetration Testing Workflows"
+7. For correlation/de-dup → `correlate --tag <target> --key ip` (or `--hashes h1,h2,h3`)
+8. For summary report → `report --tag <target>` (or `--hashes h1,h2,h3`)
+9. For correlation/pivoting → suggest multi-step workflow per "Penetration Testing Workflows"
 
 ### Multi-turn state tracking
 
-Search results include `query_hash`. AI must track the latest `query_hash` in conversation:
+Search results include `query_hash`. For a single lookup, track the latest `query_hash` in conversation. For any multi-search assessment, **prefer `--tag <target>`** over hash tracking — it is resilient to context compression (see below).
 
 - "Next page" → `cache-read --hash <hash> -p 2`
-- "Search with different criteria" → new `search`, update `query_hash`
-- "Export those results" → `cache-export --hash <hash>`
+- "Search with different criteria" → new `search --tag <target>`, update `query_hash`
+- "Correlate / deduplicate results" → `correlate --tag <target> --key ip`
+- "Generate a report" → `report --tag <target>`
 - "Filter them" → `cache-read --hash <hash> --filter "..."`
+
+### Context compression recovery (IMPORTANT)
+
+Long assessment workflows trigger context compression, which wipes the in-memory `query_hash` list you were tracking. **This must never force an F-point re-fetch** — the data is already cached. Recovery primitives:
+
+- `cache-list --tag <target>` — re-surface every hash, `query_raw`, `tag`, and `result_count` for one assessment target
+- `cache-list --query <substring>` — find queries by substring of `query_raw` (e.g. a domain)
+- `cache-tag --hash <h> --tag <target>` — retroactively tag searches you performed *without* `--tag`, so `correlate --tag` / `report --tag` still work — no re-fetch, no re-spend
+
+Once queries are tagged, `correlate --tag <target>` and `report --tag <target>` read straight from the cache. The hash list is never needed again.
 
 ## Error Handling
 
@@ -298,7 +285,9 @@ Search results include `query_hash`. AI must track the latest `query_hash` in co
 | `{"__fofa__": true, "error": true, "code": 2003}` | F-point balance insufficient — suggest recharge |
 | `{"__fofa__": true, "error": true, "code": 3001}` | Cache miss — re-run `search` |
 | `{"__fofa__": true, "error": true, "code": 4001}` | Invalid parameter — check command arguments |
+| `{"__fofa__": true, "error": true, "code": 4004}` | Not found — e.g. `--tag` with no cached queries, or `cache-tag`/`cache-delete` on an unknown hash. Run `cache-list` to see what's cached |
 | `{"__fofa__": true, "error": true, "code": 5001}` | Internal error — display `msg` to user |
+| FOFA API 820001 in msg | **Field permission denied** — user's FOFA tier lacks access to fields like `icon_hash`, `body_hash`, `mf_hash`, `product`, `category`. Drop the restricted field and retry with alternative fields (e.g., use `cert`/`jarm`/`banner` instead of `icon_hash`). Warn user which fields require higher FOFA tier. |
 | `{"__fofa__": true, "error": true, ...}` | Unknown error — display `msg` to user |
 | Non-zero exit code | Script crash — ask user to check environment |
 
@@ -311,11 +300,19 @@ Rule: page=1 is free, page>1 costs F-points
 Hard block: NEVER pass --allow-fpoints unless user explicitly authorizes
 ```
 
-- AI must **never** add `--allow-fpoints` on its own
+### Authorization Modes (in priority order)
+
+1. **Session budget** (`FOFA_FPOINTS_BUDGET=N` env var): allows up to N F-points per session without per-request confirmation. Best for multi-step assessments (Playbook 1). AI should still inform the user that pagination is in progress.
+2. **Per-request** (`--allow-fpoints`): single-request authorization. Next paginated request requires new confirmation.
+3. **Global allow** (`FOFA_ALLOW_FPOINTS=true`): bypasses code-level block. AI must still notify user before each paginated request.
+
+### Rules
+
+- AI must **never** add `--allow-fpoints` or set `FOFA_FPOINTS_BUDGET` on its own
 - On F-point denial (code 2001), explain cost and ask for authorization
-- Authorization is per-request only; next paginated request requires new confirmation
-- `stats` and `host` are free — no F-point cost
-- Even with `FOFA_ALLOW_FPOINTS=true`, AI must still notify user before each paginated request
+- For multi-step assessments, ask user to set `FOFA_FPOINTS_BUDGET=1000` once to avoid confirmation churn
+- `stats`, `host`, `correlate`, and `report` are free — no F-point cost
+- `correlate` and `report` operate entirely on local SQLite cache — use them to build reports without API calls
 
 ## Output Rules
 
@@ -332,286 +329,41 @@ Hard block: NEVER pass --allow-fpoints unless user explicitly authorizes
 
 - **Never dump full results into context**
 - Show at most 20 preview rows
-- Direct users to `cache-read` or `cache-export` for full data
+- Direct users to `cache-read` for full data
 
 ## Cache
 
 - Same conditions (query + fields + full + page + size) hit hash → use cache
 - TTL: `full=false` → 24h, `full=true` → 7 days
 - Exact hash match only, no partial/subset matching
-- **Expired cache** → `search` treats as miss and re-queries from API; `cache-read` / `cache-export` still return data with `cache_expired: true` flag
+- **Expired cache** → `search` treats as miss and re-queries from API; `cache-read` still returns data with `cache_expired: true` flag
 - When `cache_expired: true` appears, warn user that data may be stale and suggest re-running `search`
 - **Covering cache optimization** → when requesting page>1, the system automatically checks if an existing page=1 cache already has enough data to serve the request, avoiding redundant API calls. If used, the response includes `"covering_cache": true`
 
 ## Command Reference
 
-### info — Account info (cached 5 min, free)
+Full parameter reference and example outputs for all 14 subcommands have been extracted to **[docs/command-reference.md](docs/command-reference.md)**.
 
-```
-python scripts/fofa_smart.py info
-python scripts/fofa_smart.py info --refresh
-```
+Quick summary of available commands:
 
-```json
-{"__fofa__": true, "error": false, "from_cache": true, "email": "...", "isvip": true, "fcoin": 0, ...}
-```
+| Command | Purpose | F-point cost |
+|---------|---------|--------------|
+| `info` | Account info (cached 5 min) | Free |
+| `search` | Asset search with cache + F-point guard | page=1 free, page>1 costs |
+| `stats` | Statistical aggregation (cached 5 min) | Free |
+| `host` | Host details (cached 5 min) | Free |
+| `cache-read` | Read/filter cached results | Free (local) |
+| `cache-delete` | Delete a cached query | Free (local) |
+| `cache-clean` | Purge old cache entries | Free (local) |
+| `cache-stats` | Show cache row counts | Free (local) |
+| `cache-list` | List cached queries (recover hashes for correlate/report) | Free (local) |
+| `cache-tag` | Tag (or re-tag) an already-cached query — group untagged searches | Free (local) |
+| `correlate` | Cross-query correlation & de-dup (`--hashes` or `--tag`) | Free (local) |
+| `report` | Aggregated summary report (`--hashes` or `--tag`) | Free (local) |
+| `audit-log` | View operation audit trail | Free (local) |
+| `audit-clean` | Purge old audit log entries | Free (local) |
 
-### search — Asset search
-
-```
-python scripts/fofa_smart.py search \
-  -q 'host=".edu" && port="443"' \
-  -f "ip,port,host,title,server" \
-  -p 1 -s 100
-```
-
-| Param | Required | Description |
-|-------|----------|-------------|
-| `-q` | Yes | FOFA query string |
-| `-f` | No | Return fields (`--fields`), default `ip,port,protocol,host,domain,title,server` |
-| `-p` | No | Page number, default 1 |
-| `-s` | No | Page size, default 100, max 10000 |
-| `--full` | No | Search all historical data |
-| `--no-cache` | No | Skip cache, force fresh query |
-| `--allow-fpoints` | No | Allow F-point spend (pagination), only with explicit user authorization |
-
-> **Warning**: `-f` means `--fields` (which columns to return) in `search`, but `--field` (aggregation dimension) in `stats` — different meanings.
-
-Returns summary (not full data):
-```json
-{
-  "__fofa__": true,
-  "error": false,
-  "from_cache": false,
-  "query_hash": "abc123...",
-  "query_raw": "host=\".edu\" && port=\"443\"",
-  "fields": "ip,port,host,title,server",
-  "full": false,
-  "page": 1,
-  "size": 100,
-  "total": 10000,
-  "preview": [{"ip": "...", "port": "443", ...}, ...],
-  "fpoints_consumed": 0
-}
-```
-
-When covering cache is used (page>1 served from existing page=1 cache):
-```json
-{
-  "__fofa__": true,
-  "error": false,
-  "from_cache": true,
-  "covering_cache": true,
-  "query_hash": "abc123...",
-  ...
-}
-```
-
-### stats — Statistical aggregation (free, no F-point cost)
-
-```
-python scripts/fofa_smart.py stats -q 'app="Apache"' -f "port"
-python scripts/fofa_smart.py stats -q 'app="Apache"' -f "country,port"
-```
-
-| Param | Required | Description |
-|-------|----------|-------------|
-| `-q` | Yes | FOFA query string |
-| `-f` | Yes | Aggregation field(s) (`--field`), e.g. `country`, `port`, `protocol`. Comma-separated for multi-field aggregation |
-
-> **Warning**: This `-f` is `--field` (aggregation dimension), different from `search`'s `-f` (`--fields`, return columns). Supports comma-separated values for multi-field aggregation.
-
-```json
-{
-  "__fofa__": true,
-  "error": false,
-  "distinct": {"ip": 1234},
-  "aggs": [{"count": 500, "port": "80"}, {"count": 300, "port": "443"}]
-}
-```
-
-### host — Host details (free, no F-point cost)
-
-```
-python scripts/fofa_smart.py host --host "1.1.1.1"
-python scripts/fofa_smart.py host --host "1.1.1.1" --detail
-```
-
-| Param | Required | Description |
-|-------|----------|-------------|
-| `--host` | Yes | Target IP or domain |
-| `--detail` | No | Include per-port protocol/banner/cert details |
-
-Without `--detail`:
-```json
-{
-  "__fofa__": true,
-  "error": false,
-  "host": "1.1.1.1",
-  "ip": "1.1.1.1",
-  "asn": 13335,
-  "org": "Cloudflare, Inc.",
-  "country_name": "United States",
-  "port": [80, 443],
-  "protocol": ["http", "https"]
-}
-```
-
-With `--detail`, adds a `details` list with per-port protocol, banner, and certificate info:
-```json
-{
-  "__fofa__": true,
-  "error": false,
-  "host": "1.1.1.1",
-  "ip": "1.1.1.1",
-  "asn": 13335,
-  "org": "Cloudflare, Inc.",
-  "country_name": "United States",
-  "port": [80, 443],
-  "protocol": ["http", "https"],
-  "details": [
-    {"port": 80, "protocol": "http", "banner": "HTTP/1.1 ..."},
-    {"port": 443, "protocol": "https", "banner": "HTTP/1.1 ...", "cert": {...}}
-  ]
-}
-```
-
-### cache-read — Read cached results
-
-```
-python scripts/fofa_smart.py cache-read \
-  --hash "abc123..." --filter "port=443,title~admin" -p 1 -s 50
-```
-
-| Param | Description |
-|-------|-------------|
-| `--hash` | Query hash from `search` result's `query_hash` |
-| `--filter` | `field=value` exact match, `field~value` fuzzy match, comma-separated |
-| `-p` | Page number |
-| `-s` | Page size |
-
-Note: `cache-read` returns expired cache data with `cache_expired: true` — re-run `search` for fresh data.
-
-### cache-delete — Delete a cached query
-
-```
-python scripts/fofa_smart.py cache-delete --hash "abc123..."
-```
-
-### cache-export — Export cached results
-
-```
-python scripts/fofa_smart.py cache-export --hash "abc123..."
-python scripts/fofa_smart.py cache-export --hash "abc123..." --format csv -o result.csv
-```
-
-| Param | Description |
-|-------|-------------|
-| `--hash` | Query hash |
-| `--format` / `-f` | `json` (default) or `csv` |
-| `--output` / `-o` | Output path; auto-generated under `data/` if omitted |
-
-### cache-clean — Purge old cache
-
-```
-python scripts/fofa_smart.py cache-clean --days 30
-```
-
-### cache-stats — Cache statistics
-
-```
-python scripts/fofa_smart.py cache-stats
-```
-
-### audit-log — View operation audit trail
-
-```
-python scripts/fofa_smart.py audit-log
-python scripts/fofa_smart.py audit-log --limit 20
-python scripts/fofa_smart.py audit-log --command search
-```
-
-| Param | Description |
-|-------|-------------|
-| `--limit` / `-n` | Max entries to return (default 50) |
-| `--command` / `-c` | Filter by command name (e.g. search, info, cache-read) |
-
-Returns recent audit log entries with timestamp, command, query, result code, and duration:
-```json
-{
-  "__fofa__": true,
-  "error": false,
-  "total": 5,
-  "entries": [
-    {
-      "timestamp": "2026-06-14 22:30:00",
-      "command": "search",
-      "query_hash": "abc123...",
-      "query_raw": "domain=\"example.com\"",
-      "params": "{\"page\": 1, \"size\": 100}",
-      "result_code": 0,
-      "duration_ms": 523
-    }
-  ]
-}
-```
-
-## FOFA Query Syntax Reference
-
-> This reference is for AI to understand FOFA syntax. When explaining queries to users, use plain language per part — do NOT copy-paste from this table.
-
-### Basic Fields
-
-| Syntax | Example | Description |
-|--------|---------|-------------|
-| `ip` | `ip="1.1.1.1"` | IP match, supports CIDR (`ip="1.1.1.0/24"`) |
-| `port` | `port="443"` | Port number |
-| `protocol` | `protocol="https"` | Protocol type |
-| `host` | `host=".edu"` | Hostname match; leading `.` matches all hostnames ending with that suffix |
-| `domain` | `domain="example.com"` | Domain exact match |
-| `title` | `title="admin"` | Page title keyword |
-| `server` | `server="Apache"` | Server software |
-| `body` | `body="login"` | HTTP response body |
-| `header` | `header="nginx"` | HTTP response header |
-| `banner` | `banner="SSH-2.0"` | Service banner |
-| `cert` | `cert="CN=*.google.com"` | SSL certificate (broad match across all cert fields) |
-| `cert.subject` | `cert.subject="CN=*.example.com"` | Certificate subject — more granular than `cert` |
-| `cert.issuer` | `cert.issuer="CN=Let's Encrypt"` | Certificate issuer / CA |
-| `icon_hash` | `icon_hash="-247388890"` | Favicon hash |
-| `jarm` | `jarm="29d29d15d29d29d000..."` | TLS JARM fingerprint (useful for C2 detection) |
-| `body_hash` | `body_hash="abc123"` | HTTP response body hash |
-| `cname` | `cname="cdn.example.com"` | CNAME DNS record |
-
-### Asset & Ownership
-
-| Syntax | Example | Description |
-|--------|---------|-------------|
-| `app` | `app="Apache"` | Component/application |
-| `product` | `product="Apache-HTTPD"` | Product ID (Pro+ required) |
-| `category` | `category="service"` | Asset category (Pro+ required) |
-| `os` | `os="Linux"` | Operating system |
-| `asn` | `asn="15169"` | AS number |
-| `org` | `org="Google LLC"` | Organization |
-| `country` | `country="CN"` | Country (ISO code) |
-| `city` | `city="Beijing"` | City |
-| `type` | `type="service"` | Asset type |
-| `icp` | `icp="京ICP备12345678"` | ICP registration number (China) |
-| `mf_hash` | `mf_hash="xxx"` | Multi-function fingerprint hash |
-
-### Logic Operators
-
-| Syntax | Example | Description |
-|--------|---------|-------------|
-| `&&` | `port="443" && country="CN"` | AND |
-| `\|\|` | `port="80" \|\| port="443"` | OR |
-| `()` | `(app="nginx" \|\| app="apache") && country="US"` | Grouping |
-
-### Time Range
-
-| Syntax | Example | Description |
-|--------|---------|-------------|
-| `after` | `after="2024-01-01"` | After this date |
-| `before` | `before="2024-12-31"` | Before this date |
+For parameter details, examples, and sample JSON outputs, see the linked document.
 
 ## Usage Boundaries
 

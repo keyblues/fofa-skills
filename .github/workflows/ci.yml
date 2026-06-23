@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile all scripts
+        run: python -m py_compile scripts/fofa_smart.py scripts/fofa_cache.py scripts/fofa_api.py scripts/fofa_errors.py
+
+      - name: Verify CLI starts
+        run: python scripts/fofa_smart.py --version
+
+      - name: Verify CLI help works
+        run: python scripts/fofa_smart.py --help

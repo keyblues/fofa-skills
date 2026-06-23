@@ -22,12 +22,100 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, Optional, Tuple
 
+try:
+    from fofa_errors import VERSION as _VERSION
+except ImportError:  # pragma: no cover - fallback for installed package
+    _VERSION = "0.0.0"
+
+
+def _get_version() -> str:
+    return _VERSION
+
+
 BASE_URL: str = os.environ.get("FOFA_BASE_URL", "https://fofa.info/api/v1")
 
 _last_request_time: float = 0.0
 MIN_INTERVAL: float = 1.0
 MAX_RETRIES: int = 3
 TIMEOUT: int = 30
+
+# Session-level F-point budget (avoids per-request confirmation churn).
+# Set via env FOFA_FPOINTS_BUDGET=N to allow up to N F-points per session
+# without per-request AI confirmation. AI should still inform the user.
+# The spent total is persisted to a state file so it accumulates across CLI
+# invocations within one AI session (each `fofa_smart.py` call is its own
+# process; without persistence the budget could never deplete).
+_fpoints_budget: Optional[int] = None
+_fpoints_budget_resolved: bool = False
+_fpoints_spent: int = 0
+_fpoints_state_loaded: bool = False
+_FPOINTS_STATE_STALE_SEC: int = 8 * 3600
+
+
+def _fpoints_state_path() -> str:
+    """Path to the persisted F-point spend state file."""
+    return os.environ.get(
+        "FOFA_FPOINTS_STATE",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "fpoints_state.json"),
+    )
+
+
+def _load_fpoints_state(budget: int) -> None:
+    """Load persisted spent total if budget matches and state is fresh.
+
+    Fails open: any read/parse error or stale/foreign-budget state leaves
+    ``_fpoints_spent`` at 0, which is safe (the guard then re-accumulates
+    from scratch rather than trusting bad data).
+    """
+    global _fpoints_spent, _fpoints_state_loaded
+    _fpoints_state_loaded = True
+    try:
+        with open(_fpoints_state_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict) or data.get("budget") != budget:
+        return  # budget changed → treat as a new session
+    updated = data.get("updated", 0)
+    if not isinstance(updated, (int, float)) or time.time() - updated > _FPOINTS_STATE_STALE_SEC:
+        return  # stale → reset
+    spent = data.get("spent", 0)
+    if isinstance(spent, int) and spent >= 0:
+        _fpoints_spent = spent
+
+
+def _save_fpoints_state(budget: int) -> None:
+    """Persist spent total so subsequent CLI invocations see it.
+
+    Best-effort: a write failure must never block a search.
+    """
+    path = _fpoints_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"budget": budget, "spent": _fpoints_spent, "updated": time.time()}, f)
+    except OSError:
+        pass
+
+
+def _resolve_fpoints_budget() -> Optional[int]:
+    """Load session F-point budget from env (cached after first read).
+
+    Returns the budget int, or None if unset/invalid (per-request
+    authorization mode then applies). The None result is also cached.
+    """
+    global _fpoints_budget, _fpoints_budget_resolved
+    if not _fpoints_budget_resolved:
+        _fpoints_budget_resolved = True
+        raw = os.environ.get("FOFA_FPOINTS_BUDGET", "")
+        if raw and raw.isdigit():
+            _fpoints_budget = int(raw)
+    return _fpoints_budget
+
+
+def get_fpoints_spent() -> int:
+    """Return cumulative F-points consumed in this session."""
+    return _fpoints_spent
 
 
 def _rate_limit() -> None:
@@ -37,6 +125,65 @@ def _rate_limit() -> None:
     if elapsed < MIN_INTERVAL:
         time.sleep(MIN_INTERVAL - elapsed)
     _last_request_time = time.time()
+
+
+def _check_fpoints(page: int, allow_fpoints: bool, size: int = 100) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Return (ok, error_dict). Supports session-level budget.
+
+    In budget mode, the estimated cost is reserved (added to ``_fpoints_spent``
+    and persisted) up-front. If the request later fails, the caller MUST call
+    ``_refund_fpoints(cost)`` so a network/API failure does not deplete the
+    budget for FOFA charges that never happened. The reservation pattern keeps
+    concurrent reservations honest under a single-process model.
+    """
+    global _fpoints_spent
+    if page <= 1:
+        return True, None
+
+    # Estimate F-point cost for this request (page-1)*size is approximate.
+    estimated_cost = (page - 1) * size
+
+    # Session budget mode: check if within remaining budget
+    budget = _resolve_fpoints_budget()
+    if budget is not None:
+        # Load persisted spend from prior CLI invocations in this session.
+        if not _fpoints_state_loaded:
+            _load_fpoints_state(budget)
+        if _fpoints_spent + estimated_cost > budget:
+            return False, {
+                "error": True,
+                "msg": f"F-point budget exceeded: session budget {budget}, already spent {_fpoints_spent}, "
+                       f"this request needs ~{estimated_cost}. Ask user to raise FOFA_FPOINTS_BUDGET.",
+                "code": 2001,
+            }
+        _fpoints_spent += estimated_cost
+        _save_fpoints_state(budget)
+        return True, None
+
+    # Per-request authorization mode (original behavior)
+    if not allow_fpoints:
+        return False, {
+            "error": True,
+            "msg": "F-point spend denied: pagination requires F-points. Explicitly authorize and retry.",
+            "code": 2001,
+        }
+    return True, None
+
+
+def _refund_fpoints(cost: int) -> None:
+    """Refund a previously reserved F-point cost when the request failed.
+
+    No-op outside budget mode or for non-positive cost. Safe to call even if
+    no reservation was made (e.g. page=1, which never reserves).
+    """
+    global _fpoints_spent
+    if cost <= 0:
+        return
+    budget = _resolve_fpoints_budget()
+    if budget is None:
+        return  # per-request mode tracks no spend
+    _fpoints_spent = max(0, _fpoints_spent - cost)
+    _save_fpoints_state(budget)
 
 
 def _check_business_error(data: Any) -> Optional[Dict[str, Any]]:
@@ -55,8 +202,12 @@ def _check_business_error(data: Any) -> Optional[Dict[str, Any]]:
     errmsg = data.get("errmsg")
     error_flag = data.get("error")
 
-    # FOFA returns errmsg as a non-empty/non-zero string on business errors
-    has_errmsg = errmsg is not None and errmsg is not False and errmsg != 0 and errmsg != "0"
+    # FOFA returns errmsg as a non-empty string on business errors.
+    # 注意：空字符串 "" 和 "0" 不应被视为错误（正常响应可能包含这些值）。
+    has_errmsg = isinstance(errmsg, str) and errmsg != "" and errmsg != "0"
+    # 某些接口用非零数字表示错误码
+    if isinstance(errmsg, int) and errmsg != 0:
+        has_errmsg = True
 
     # Some endpoints use "error": true or "error": -1
     has_error_flag = error_flag is True or (isinstance(error_flag, int) and error_flag < 0)
@@ -71,6 +222,10 @@ def _check_business_error(data: Any) -> Optional[Dict[str, Any]]:
                 return {"error": True, "msg": f"FOFA API [{fofa_code}]: {msg}", "code": 1002}
             elif fofa_code == 90003:
                 return {"error": True, "msg": f"FOFA API [{fofa_code}]: {msg}", "code": 2002}
+        # F 点余额不足：FOFA 错误码不固定，基于 msg 关键词识别
+        # 映射到 2003 (QUOTA_EXCEEDED)，与 SKILL.md 定义一致
+        if any(kw in msg for kw in ("余额不足", "F点不足", "F-coin", "insufficient")):
+            return {"error": True, "msg": f"FOFA API: {msg}", "code": 2003}
         return {"error": True, "msg": f"FOFA API: {msg}", "code": 1001}
 
     return None
@@ -83,9 +238,24 @@ def _request(url: str, retries: int = MAX_RETRIES) -> Dict[str, Any]:
         try:
             req = urllib.request.Request(url)
             req.add_header("Accept", "application/json")
+            req.add_header("User-Agent", f"fofa-skills/{_get_version()}")
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 body = resp.read().decode("utf-8")
-                data = json.loads(body)
+                try:
+                    data = json.loads(body)
+                except json.JSONDecodeError:
+                    preview = body[:200].replace("\n", " ")
+                    return {
+                        "error": True,
+                        "msg": f"Non-JSON response from FOFA (HTTP {resp.status}): {preview!r}",
+                        "code": 1001,
+                    }
+                if not isinstance(data, dict):
+                    return {
+                        "error": True,
+                        "msg": f"Unexpected JSON shape from FOFA: type={type(data).__name__}",
+                        "code": 1001,
+                    }
                 # Check FOFA business-level errors (HTTP 200 but API error)
                 biz_err = _check_business_error(data)
                 if biz_err is not None:
@@ -110,19 +280,6 @@ def _request(url: str, retries: int = MAX_RETRIES) -> Dict[str, Any]:
             return {"error": True, "msg": str(e.reason), "code": 1004}
     # Safety fallback
     return {"error": True, "msg": "max retries exceeded", "code": 1001}
-
-
-def _check_fpoints(page: int, allow_fpoints: bool) -> Tuple[bool, Optional[Dict[str, Any]]]:
-    """Return (ok, error_dict)."""
-    if page <= 1:
-        return True, None
-    if not allow_fpoints:
-        return False, {
-            "error": True,
-            "msg": "F-point spend denied: pagination requires F-points. Explicitly authorize and retry.",
-            "code": 2001,
-        }
-    return True, None
 
 
 def _normalize_host_response(data: Dict[str, Any], detail: bool) -> Dict[str, Any]:
@@ -170,7 +327,9 @@ def search(
     allow_fpoints: bool = False,
 ) -> Dict[str, Any]:
     """Search FOFA's database. Returns API response dict or error envelope."""
-    ok, err = _check_fpoints(page, allow_fpoints)
+    # Reserve the estimated F-point cost up-front (budget mode only).
+    reserved_cost = (page - 1) * size if page > 1 else 0
+    ok, err = _check_fpoints(page, allow_fpoints, size)
     if not ok:
         return err  # type: ignore[return-value]
 
@@ -180,7 +339,12 @@ def search(
         "fields": fields, "page": page, "size": size,
         "full": str(full).lower(),
     })
-    return _request(f"{BASE_URL}/search/all?{params}")
+    resp = _request(f"{BASE_URL}/search/all?{params}")
+    # If the request failed, FOFA never charged anything — refund the reservation
+    # so a flaky network / API error doesn't deplete the session budget.
+    if resp.get("error") and reserved_cost > 0:
+        _refund_fpoints(reserved_cost)
+    return resp
 
 
 def get_info(key: str) -> Dict[str, Any]:

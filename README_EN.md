@@ -1,4 +1,4 @@
-s'k# fofa-skills
+# fofa-skills
 
 <p align="center">
   <b>FOFA Cyberspace Search Engine · Claude Code Skill</b><br>
@@ -15,30 +15,31 @@ s'k# fofa-skills
 
 ---
 
-## Why fofa-skills?
+## What is this
 
-FOFA has a powerful API, but using it effectively from an AI assistant involves real engineering problems:
+**fofa-skills** is a Claude Code / AI Agent Skill for the [FOFA](https://fofa.info) cyberspace search engine.
 
-- **Context explosion** — a single query can return 10,000 results. Dumping them into the LLM context is wasteful and expensive.
-- **F-point budget** — pagination costs money. An AI that blindly fetches page after page can burn through F-points in seconds.
-- **Duplicate API calls** — the same query run twice wastes quota and time.
-- **Rate limits** — FOFA enforces 1 req/s. Burst requests get 429'd.
+It solves four engineering problems that arise when letting AI call the FOFA API directly:
 
-fofa-skills solves all of these. It is a **Claude Code Skill + tool-script bundle** that wraps the FOFA API with caching, rate limiting, a hard F-point guard, and AI-optimized output.
+| Problem | Solution |
+|---------|----------|
+| **Context explosion** — a single query returns up to 10,000 rows, dumping them into the LLM is wasteful and expensive | Search returns only a summary + 20-row preview; full results live in SQLite, accessed via `cache-read` |
+| **F-point budget burn** — pagination costs F-points; an AI paging blindly can exhaust the balance in seconds | `page > 1` is hard-blocked by default; requires explicit user authorization |
+| **Duplicate API calls** — the same query hit repeatedly wastes quota and time | SHA-256 hash cache with exact-match reuse and covering-cache optimization |
+| **Rate limits** — FOFA enforces 1 req/s; bursts get 429'd | Built-in 1-second throttle + exponential backoff on 429 |
 
 ## Features
 
-| Feature | How |
-|---------|-----|
-| **F-point Budget Guard** | Page > 1 is blocked by default. Only proceeds when user explicitly authorizes F-point spend |
-| **Hash-based Caching** | SHA-256(query + fields + page + size) → SQLite. Exact-match reuse, no stale data confusion |
-| **Summary-only Output** | Search returns metadata + 20-row preview. Full results live in SQLite, accessed via `cache-read` |
-| **Rate Limiting** | Built-in 1-second interval + exponential backoff on 429 |
-| **Account Info Caching** | 5-minute TTL — avoids extra API calls on every search |
-| **Zero pip deps** | sqlite3, urllib, json, hashlib, argparse — all stdlib |
-| **AI-First CLI** | Structured JSON on stdout. Designed for LLM tool-calling |
+- **F-point Budget Guard** — a hard safety lock, not a config switch; `page > 1` denied by default
+- **Hash-based Caching** — SHA-256(query + fields + page + size) → SQLite, exact match
+- **Summary-only Output** — search returns metadata + 20-row preview; full data read on demand
+- **Rate Limiting** — 1-second interval + exponential backoff on 429
+- **Account Info Caching** — 5-minute TTL avoids redundant info API calls
+- **Audit Log** — every operation recorded; can be purged by date
+- **Zero pip deps** — Python standard library only
+- **AI-First CLI** — structured JSON on stdout, designed for LLM tool-calling
 
-## Quick Start
+## Installation
 
 ```bash
 git clone https://github.com/<user>/fofa-skills.git
@@ -49,55 +50,9 @@ export FOFA_KEY="your_32_char_api_key"
 
 # Verify account
 python scripts/fofa_smart.py info
-
-# Search — returns summary only, saves full results to cache
-python scripts/fofa_smart.py search -q 'host=".edu" && port="443"' -f "ip,port,host,title"
-
-# Read cached results with filtering
-python scripts/fofa_smart.py cache-read --hash "<query_hash>" --filter "country=CN" -p 1 -s 50
 ```
 
-## Usage Scenarios
-
-### Asset Discovery
-```bash
-python scripts/fofa_smart.py search -q 'domain="example.com"'
-python scripts/fofa_smart.py search -q 'protocol="mysql" && country="CN"'
-python scripts/fofa_smart.py search -q 'ip="1.1.1.0/24"'
-```
-
-### Vulnerability Mapping
-```bash
-python scripts/fofa_smart.py search -q 'server="Apache/2.4.49"' --full
-python scripts/fofa_smart.py search -q 'app="Log4j"'
-```
-
-### Threat Intelligence
-```bash
-python scripts/fofa_smart.py search -q 'cert="CN=*.suspicious-domain.com"'
-```
-
-### Fingerprinting
-```bash
-python scripts/fofa_smart.py search -q 'icon_hash="-247388890"'
-python scripts/fofa_smart.py search -q 'header="nginx/1.18.0"'
-```
-
-### Statistics & Host Info
-```bash
-# Port distribution for a component
-python scripts/fofa_smart.py stats -q 'app="Apache"' -f "port"
-
-# Detailed host information
-python scripts/fofa_smart.py host --host "1.1.1.1" --detail
-```
-
-## Version
-
-```bash
-python scripts/fofa_smart.py --version
-# fofa-skills 0.1.0
-```
+> You may also `pip install -e .` to register a global `fofa-skills` command, but this installs **no third-party packages** — it only registers the entry point.
 
 ## Architecture
 
@@ -108,10 +63,8 @@ python scripts/fofa_smart.py --version
 └──────────────┬──────────────────────────────────┘
                │
      ┌─────────▼──────────┐
-     │   fofa_smart.py    │  Orchestration CLI
-     │   (10 subcommands)  │  · info / search / stats / host
-     └──┬──────────────┬──┘  · cache-read / delete / export / clean / stats
-        │              │     · audit-log
+     │   fofa_smart.py    │  Orchestration CLI (14 subcommands)
+     └──┬──────────────┬──┘
         │              │
    ┌────▼────┐   ┌─────▼──────┐
    │fofa_api │   │ fofa_cache │
@@ -126,27 +79,74 @@ python scripts/fofa_smart.py --version
    └─────────┘
 ```
 
-## F-Point Budget Guard
+**14 subcommands**: `info` · `search` · `stats` · `host` · `cache-read` · `cache-delete` · `cache-clean` · `cache-stats` · `cache-list` · `cache-tag` · `correlate` · `report` · `audit-log` · `audit-clean`
 
-This is a **hard safety lock**, not a configuration option.
+## Project Structure
 
-```python
-# fofa_api.py — every search() call
-if page > 1 and not allow_fpoints:
-    return {"error": True, "msg": "F-point spend denied", "code": 2001}
+```
+fofa-skills/
+├── SKILL.md                      # Claude Code Skill instruction (concise)
+├── docs/
+│   ├── playbooks.md              # 5 asset discovery playbooks + 7-dimension model
+│   ├── command-reference.md      # Full parameter reference for 14 subcommands
+│   └── fofa-syntax.md            # FOFA query syntax reference
+├── scripts/
+│   ├── fofa_errors.py            # Unified JSON error envelope + stderr logging
+│   ├── fofa_cache.py             # SQLite cache layer
+│   ├── fofa_api.py               # API layer (throttle/retry/F-point guard/error detection)
+│   └── fofa_smart.py             # CLI entry point
+├── examples/
+│   └── sample-outputs.txt        # Sample outputs
+├── data/
+│   └── fofa_cache.db             # Auto-created on first run
+├── README.md                     # Project overview (Chinese)
+├── README_EN.md                  # Project overview (English)
+├── CHANGELOG.md                  # Version history
+├── CONTRIBUTING.md               # Contribution guide
+├── pyproject.toml                # Project metadata
+└── LICENSE                       # MIT
 ```
 
-- **Default**: page 1 only, zero F-points consumed
-- **To unlock**: user must explicitly authorize F-point consumption
-- **Scope**: per-request. Unlocking one query does not unlock the next
+## Design Principles
+
+- **Zero dependencies** — stdlib only, clone and run, no environment pollution
+- **Security first** — hard F-point block, audit log, built-in refusal rules
+- **AI-friendly** — JSON output, `__fofa__` marker, summaries not full dumps
+- **Exact caching** — only exact hash matching, no query splitting, safe over clever
+
+> **Concurrency note**: built-in rate limiting (1 req/s) uses a single-process global variable, suitable for a single Claude Code session. Multi-process or multi-threaded embedding requires external rate limiting.
+
+## F-Point Budget Guard
+
+This is a **hard safety lock**, not a configuration option:
+
+- **Default**: `page=1` only, zero F-points consumed
+- **To unlock**: user must explicitly authorize F-point spend
+- **Scope**: per-request — unlocking one query does not unlock the next
 
 ## Caching Strategy
 
-- **Exact hash match only** — query + fields + full + page + size all participate in the hash
-- **No syntactic analysis** — `host=".edu"` and `host=".edu" && port="443"` are separate cache entries. Safe over clever.
-- **Covering cache optimization** — when requesting page>1, automatically checks if an existing page=1 cache already has enough data to serve the request, avoiding redundant API calls
+- **Exact hash match** — query + fields + full + page + size all participate in the hash
+- **Covering cache optimization** — requesting `page>1` auto-checks whether an existing `page=1` cache already covers the needed range
 - **TTL**: `full=false` 24 hours, `full=true` 7 days
 - **Account info**: separate cache, 5-minute TTL
+
+## FAQ
+
+**Q: Can free registered users use it?**
+A: No. Registered users have no API access. Every search first verifies the account via the info endpoint; unpaid accounts are rejected.
+
+**Q: Can I disable caching?**
+A: `search` supports `--no-cache` to skip the cache, but it's not recommended for regular use. For fresh data, shorten TTL or manually run `cache-clean`.
+
+**Q: Can I use it as a standalone CLI?**
+A: Yes. All output is structured JSON; it works without an AI agent.
+
+**Q: Why no query-subset cache reuse?**
+A: Intentional. FOFA syntax is complex; subset matching is error-prone. Safety over cleverness — exact hash only.
+
+**Q: What does the audit log record?**
+A: Timestamp, subcommand, query, parameters, result code, duration. View with `audit-log`, purge with `audit-clean`.
 
 ## Contributing
 
